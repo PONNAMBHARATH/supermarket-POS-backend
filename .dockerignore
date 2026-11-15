@@ -1,0 +1,13 @@
+# Version control, dependencies, and build output
+**/.git
+**/node_modules
+**/dist
+**/npm-debug.log*
+
+# Environment files belong in runtime configuration or public build args
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+**/.envrc
+**/.envrc.*
