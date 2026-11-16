@@ -34,3 +34,19 @@ The API is at `http://localhost:8080/api/v1`. Swagger is at `http://localhost:80
 Set the R2 S3 endpoint, bucket name, and bucket-scoped credentials in the backend environment. Set `OBJECT_STORAGE_PUBLIC_BASE_URL` to the public image origin and `OBJECT_STORAGE_PREFIX` to the folder name (default `products`). The owner-only `POST /api/v1/images` route accepts JPEG, PNG, or WebP bytes up to 5 MB and returns an `imageUrl` for the product or offer.
 
 Keep real environment files local or in the host's environment settings. Commit only placeholder values in `.env.example`.
+
+## Billing calculation contract
+
+Prices are tax-exclusive. Quantities support three decimal places. Each line's
+subtotal and tax round half up to two decimal places; bill totals sum those rounded
+lines. Product tax rates apply only when the `tax_enabled` setting equals `true`
+(the seed defaults to `false`). `default_tax_rate` is not a fallback for a product
+whose tax rate is zero.
+
+Checkout requires a UUID `checkoutKey` and `expectedTotal`. Retry an uncertain
+request with exactly the same key and payload. A changed total returns 409 before
+saving. The updated schema adds nullable `checkoutKey` and `requestHash` sale
+columns; run `npx prisma db push` for local development, or restart the Compose
+API with a rebuild, before using the updated frontend.
+
+Run billing calculation tests with `npm test`.

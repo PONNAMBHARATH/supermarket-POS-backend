@@ -65,6 +65,8 @@ model Customer {
 
 model Sale {
   id          Int         @id @default(autoincrement())
+  checkoutKey String?     @unique
+  requestHash String?
   invoiceNo   String      @unique
   customerId  Int?
   userId      Int

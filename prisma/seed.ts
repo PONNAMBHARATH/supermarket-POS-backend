@@ -16,7 +16,8 @@ async function main() {
   for (const name of ["Counter 1", "Counter 2"])
     await p.counter.upsert({ where: { name }, update: {}, create: { name } });
   for (const [key, value] of Object.entries({
-    store_name: "My Supermarket",
+    store_name: "Thirumala SuperMarket",
+    store_address: "Gopalraopet",
     tax_enabled: "false",
     default_tax_rate: "0",
     currency: "INR",

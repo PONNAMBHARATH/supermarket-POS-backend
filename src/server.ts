@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+import { lineAmounts } from "./billing";
 import express, { type RequestHandler } from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -266,78 +268,81 @@ app.post(
   wrap(async (q: any, r) => {
     const b = z
       .object({
+        checkoutKey: z.string().uuid(),
+        expectedTotal: z.number().finite().nonnegative(),
         counterId: z.number().int().positive(),
         customer: z
-          .object({ name: z.string().min(1), phone: z.string().min(8) })
+          .object({ name: z.string().trim().min(1).max(191), phone: z.string().trim().min(8).max(20) })
           .optional(),
-        customerId: z.number().int().optional(),
+        customerId: z.number().int().positive().optional(),
         paymentMode: z.enum(["CASH", "UPI"]),
-        discount: z.number().nonnegative().default(0),
+        discount: z.number().finite().nonnegative().multipleOf(0.01).default(0),
         notes: z.string().optional(),
         items: z
           .array(
             z.object({
-              productId: z.number().int(),
-              quantity: z.number().positive(),
+              productId: z.number().int().positive(),
+              quantity: z.number().finite().positive().max(999999999).multipleOf(0.001),
             }),
           )
-          .min(1),
+          .min(1).max(500),
       })
       .parse(q.body);
-    if (b.discount > 0 && q.user.role !== "OWNER")
-      return r
-        .status(403)
-        .json({ error: "Owner approval required for discount" });
-    const ps = await db.product.findMany({
-      where: { id: { in: b.items.map((i) => i.productId) }, active: true },
+    const requestHash = createHash("sha256").update(JSON.stringify({ ...b, userId: q.user.id })).digest("hex");
+    const existing = await db.sale.findUnique({ where: { checkoutKey: b.checkoutKey }, include: { items: true, customer: true, counter: true, user: { select: { name: true } } } });
+    if (existing) {
+      if (existing.requestHash !== requestHash) return r.status(409).json({ error: "Checkout key already used for a different bill" });
+      return r.json(existing);
+    }
+    const cashier = await db.user.findUnique({ where: { id: q.user.id } });
+    if (!cashier?.active) return r.status(401).json({ error: "Staff account is inactive" });
+    if (b.discount > 0 && cashier.role !== "OWNER")
+      return r.status(403).json({ error: "Owner approval required for discount" });
+    if (new Set(b.items.map(i => i.productId)).size !== b.items.length)
+      return r.status(400).json({ error: "Combine duplicate products into one bill line" });
+    if (b.customer && b.customerId) return r.status(400).json({ error: "Choose one customer" });
+    const counter = await db.counter.findFirst({ where: { id: b.counterId, active: true } });
+    if (!counter) return r.status(400).json({ error: "Invalid or inactive counter" });
+    if (b.customerId && !await db.customer.findUnique({ where: { id: b.customerId } }))
+      return r.status(400).json({ error: "Customer not found" });
+    const ps = await db.product.findMany({ where: { id: { in: b.items.map(i => i.productId) }, active: true } });
+    if (ps.length !== b.items.length) return r.status(400).json({ error: "Invalid or inactive product" });
+    const taxSetting = await db.appSetting.findUnique({ where: { key: "tax_enabled" } });
+    const taxEnabled = taxSetting?.value === "true";
+    let subtotalCents = 0, taxCents = 0;
+    const lines = b.items.map(i => {
+      const p = ps.find(x => x.id === i.productId)!;
+      const taxRate = taxEnabled ? p.taxRate : 0;
+      const amounts = lineAmounts(p.sellingPrice.toString(), i.quantity, taxRate.toString());
+      subtotalCents += amounts.base;
+      taxCents += amounts.tax;
+      return { productId: p.id, productName: p.name, quantity: i.quantity, unitPrice: p.sellingPrice,
+        purchaseCost: p.purchaseCost, taxRate, lineTotal: amounts.total / 100 };
     });
-    if (ps.length !== new Set(b.items.map((i) => i.productId)).size)
-      return r.status(400).json({ error: "Invalid or inactive product" });
-    let subtotal = 0,
-      tax = 0;
-    const lines = b.items.map((i) => {
-      const p = ps.find((x) => x.id === i.productId)!;
-      const line = Number(p.sellingPrice) * i.quantity;
-      const t = (line * Number(p.taxRate)) / 100;
-      subtotal += line;
-      tax += t;
-      return {
-        productId: p.id,
-        productName: p.name,
-        quantity: i.quantity,
-        unitPrice: p.sellingPrice,
-        purchaseCost: p.purchaseCost,
-        taxRate: p.taxRate,
-        lineTotal: line + t,
-      };
-    });
-    if (b.discount > subtotal + tax)
-      return r.status(400).json({ error: "Discount exceeds bill total" });
-    const c = b.customer
-      ? await db.customer.upsert({
-          where: { phone: b.customer.phone },
-          update: { name: b.customer.name },
-          create: b.customer,
-        })
-      : b.customerId
-        ? await db.customer.findUnique({ where: { id: b.customerId } })
-        : null;
-    const sale = await db.sale.create({
-      data: {
-        invoiceNo: "INV-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
-        customerId: c?.id,
-        userId: q.user.id,
-        counterId: b.counterId,
-        subtotal,
-        discount: b.discount,
-        taxTotal: tax,
-        grandTotal: subtotal + tax - b.discount,
-        paymentMode: b.paymentMode,
-        notes: b.notes,
-        items: { create: lines },
-      },
-      include: { items: true, customer: true, counter: true },
-    });
+    const discountCents = Math.round(b.discount * 100);
+    const totalCents = subtotalCents + taxCents - discountCents;
+    if (totalCents < 0) return r.status(400).json({ error: "Discount exceeds bill total" });
+    if (totalCents > 999999999999) return r.status(400).json({ error: "Bill exceeds supported amount" });
+    if (Math.round(b.expectedTotal * 100) !== totalCents)
+      return r.status(409).json({ error: "Prices or tax settings changed. Refresh the billing page and rebuild the bill before collecting payment." });
+    let sale;
+    try {
+      sale = await db.$transaction(async tx => {
+        const customer = b.customer ? await tx.customer.upsert({ where: { phone: b.customer.phone }, update: {}, create: b.customer }) : null;
+        return tx.sale.create({ data: {
+          checkoutKey: b.checkoutKey, requestHash, invoiceNo: "INV-" + randomUUID(),
+          customerId: customer?.id ?? b.customerId, userId: q.user.id, counterId: b.counterId,
+          subtotal: subtotalCents / 100, discount: b.discount, taxTotal: taxCents / 100,
+          grandTotal: totalCents / 100, paymentMode: b.paymentMode, notes: b.notes,
+          items: { create: lines },
+        }, include: { items: true, customer: true, counter: true, user: { select: { name: true } } } });
+      });
+    } catch (error) {
+      // A concurrent retry may have committed the same checkout first.
+      const saved = await db.sale.findUnique({ where: { checkoutKey: b.checkoutKey }, include: { items: true, customer: true, counter: true, user: { select: { name: true } } } });
+      if (!saved || saved.requestHash !== requestHash) throw error;
+      sale = saved;
+    }
     r.status(201).json(sale);
   }),
 );
@@ -366,7 +371,7 @@ app.get(
     r.json(
       await db.sale.findMany({
         where: { createdAt: { gte: from, lte: to } },
-        include: { items: true, customer: true, counter: true },
+        include: { items: true, customer: true, counter: true, user: { select: { name: true } } },
         orderBy: { createdAt: "desc" },
         take: 100,
       }),
@@ -427,7 +432,7 @@ app.get(
       date: `${from.getFullYear()}-${String(from.getMonth() + 1).padStart(2, "0")}-${String(from.getDate()).padStart(2, "0")}`,
       billCount: sales.length,
       revenue,
-      grossProfitEstimate: gross,
+      grossProfitEstimate: gross - sales.reduce((sum, sale) => sum + Number(sale.discount), 0),
       payments,
       counters: Object.values(counters),
     });

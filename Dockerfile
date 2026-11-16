@@ -5,4 +5,4 @@ RUN npm install
 COPY . .
 RUN npm run build
 EXPOSE 8080
-CMD ["sh", "-c", "npx prisma db push && node dist/src/server.js"]
+CMD ["sh", "-c", "node dist/src/prepare-db.js && npx prisma db push && node dist/src/server.js"]
